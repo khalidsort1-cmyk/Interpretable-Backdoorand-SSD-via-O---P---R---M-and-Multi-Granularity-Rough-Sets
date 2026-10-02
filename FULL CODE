@@ -1,0 +1,1525 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+
+         Outgoing-Packet Repetition Matching
+         + Granular Computing with Rough Sets
+================================================================
+Directional reduction: only outgoing repeated packets sharing the
+same destination and port are compared. Fusion with multi-granularity
+rough sets at k = 2, 4, 8.
+
+Fixes in this version:
+  1. prep() drops ALL label-like columns (attack_cat, class, target,
+     type, malicious, category, subcategory, flow_id, session_id, ...)
+     to eliminate the perfect-1.0 tree-model leak seen on
+     NIDS_Bench_2026.
+  2. KAC-GR (all outgoing) simplified to k=4 only — k=8 over 27+
+     features caused sparse granules and regression on some datasets.
+  3. Granular Rough / Rough Set (ALONE) baselines use smaller
+     min_granule_size / min_class_size so they stop collapsing to
+     majority class on high-dimensional datasets.
+  Plus (from previous version):
+  * _norm() column-name normalisation.
+  * Expanded alias tables for outgoing and stepping-stone features.
+  * Diagnostic prints for KAC-feature collapse.
+
+Outputs:
+  paper2_kac_flat_rules.csv
+  paper2_kac_gr_medium_rules.csv
+  paper2_kac_gr_all_outgoing_rules.csv
+  paper2_ssd_gr_rules.csv
+  paper2_tiers.csv
+  paper2_roc.png, paper2_pr.png, paper2_cm.png
+  paper2_importance_*.png
+"""
+
+import numpy as np
+import pandas as pd
+import os, glob, re, time, warnings
+from collections import Counter
+
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, average_precision_score, roc_curve,
+    precision_recall_curve, confusion_matrix)
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
+    AdaBoostClassifier, ExtraTreesClassifier)
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.neural_network import MLPClassifier
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+warnings.filterwarnings('ignore')
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+try:
+    from statsmodels.stats.contingency_tables import mcnemar as _sm_mcnemar
+    HAS_SM = True
+except ImportError:
+    HAS_SM = False
+
+# =============================================================================
+# 0. COLUMN-NAME NORMALISATION HELPER
+# =============================================================================
+def _norm(s):
+    """Normalise a column name: lowercase, non-alphanumeric → underscore."""
+    return re.sub(r'[^a-z0-9]+', '_', str(s).strip().lower()).strip('_')
+
+# =============================================================================
+# 1. KAC FEATURES
+# =============================================================================
+KAC_FEATURES = ['out_pkt_repetition_count', 'out_pkt_size_match',
+                'out_pkt_interval_match', 'out_pkt_same_dest_port_ratio',
+                'out_pkt_byte_match', 'khalid_risk_score']
+
+# =============================================================================
+# 1b. OUTGOING FEATURE NAMESPACE
+# =============================================================================
+OUTGOING_SOURCE_MAP = {
+    'out_src_pkts': [
+        'spkts', 'src_pkts', 's_pkts', 'fwd_packets', 'tot_fwd_pkts',
+        's_pkts_count', 'total_fwd_packets', 'total_forward_packets',
+        'total_fwd_pkt', 'src_pkts_count', 'src_packet_count',
+        'fwd_pkts_total', 'num_fwd_packets',
+    ],
+    'out_src_bytes': [
+        'sbytes', 'src_bytes', 's_bytes', 'fwd_bytes', 'totlen_fwd_pkts',
+        'total_length_of_fwd_packets', 'total_length_of_fwd_packet',
+        'total_length_fwd_packets', 'src_bytes_count', 'total_src_bytes',
+        'fwd_bytes_total', 'num_fwd_bytes',
+    ],
+    'out_src_mean_size': [
+        'smean', 'fwd_pkt_len_mean', 'fwd_packet_length_mean',
+        'average_packet_size', 'avg_fwd_segment_size',
+        'average_fwd_segment_size', 'mean_fwd_pkt_len',
+        'mean_fwd_packet_length', 'fwd_seg_size_avg',
+        'fwd_segment_size_avg', 'avg_fwd_pkt_len',
+    ],
+    'out_src_inter_pkt': [
+        'sinpkt', 'src_inter_pkt', 'fwd_iat_mean', 'flow_iat_mean',
+        'mean_time_between_fwd_packets', 'mean_time_between_fwd_packet',
+        'fwd_iat_mean_', 'fwd_iat_mean', 'fwd_iat', 'sinpkt_mean',
+        'src_inter_pkt_mean', 'mean_fwd_iat',
+    ],
+    'out_src_jitter': [
+        'sjit', 'src_jitter', 'fwd_iat_std', 'fwd_iat_std_',
+        'std_fwd_iat', 'src_jitter_std',
+    ],
+    'out_src_win': [
+        'swin', 'src_win', 'init_fwd_win_bytes', 'fwd_win_byts',
+        'init_win_bytes_forward', 'src_win_byts',
+    ],
+    'out_src_tcp_base': ['stcpb', 'src_tcp_base', 'src_tcpb'],
+    'out_src_ttl': [
+        'sttl', 'src_ttl', 'fwd_ttl', 'fwd_segment_ttl', 'source_ttl',
+    ],
+    'out_src_load': [
+        'sload', 'src_load', 'fwd_seg_size_avg_', 'src_load_rate',
+        'fwd_seg_size_avg', 'sload_rate',
+    ],
+    'out_src_loss': ['sloss', 'src_loss'],
+    'out_src_header_len': [
+        'smean_header', 'fwd_header_len', 'fwd_header_length',
+        'fwd_header_length_1', 'src_header_len',
+    ],
+    'out_src_rate': [
+        'srate', 'fwd_pkts_s', 'fwd_packets_s', 'fwd_pkts_per_s',
+        'src_rate', 'fwd_pkt_rate',
+    ],
+    'out_src_max_pkt': [
+        'fwd_pkt_len_max', 'max_packet_length', 'max_fwd_pkt_len',
+        'max_fwd_packet_length', 'fwd_packet_length_max',
+        'src_max_pkt', 'src_pkt_len_max',
+    ],
+    'out_src_min_pkt': [
+        'fwd_pkt_len_min', 'min_packet_length', 'min_fwd_pkt_len',
+        'min_fwd_packet_length', 'fwd_packet_length_min',
+        'src_min_pkt', 'src_pkt_len_min',
+    ],
+    'out_src_std_pkt': [
+        'fwd_pkt_len_std', 'std_packet_length', 'std_fwd_pkt_len',
+        'fwd_packet_length_std', 'std_fwd_packet_length',
+        'src_pkt_len_std',
+    ],
+    'out_src_iat_total': [
+        'fwd_iat_total', 'total_time_between_fwd_packets',
+        'total_fwd_iat', 'flow_iat_total',
+    ],
+    'out_src_iat_max': [
+        'fwd_iat_max', 'max_time_between_fwd_packets', 'flow_iat_max',
+    ],
+    'out_src_iat_min': [
+        'fwd_iat_min', 'min_time_between_fwd_packets', 'flow_iat_min',
+    ],
+    'out_src_psh_flags': ['fwd_psh_flags', 'fwd_psh_flag'],
+    'out_src_urg_flags': ['fwd_urg_flags', 'fwd_urg_flag'],
+}
+
+ALL_OUTGOING_FEATURES = [
+    'out_pkt_repetition_count', 'out_pkt_size_match',
+    'out_pkt_interval_match', 'out_pkt_same_dest_port_ratio',
+    'out_pkt_byte_match', 'khalid_risk_score',
+    'out_src_pkts', 'out_src_bytes', 'out_src_mean_size',
+    'out_src_inter_pkt', 'out_src_jitter', 'out_src_win',
+    'out_src_tcp_base', 'out_src_ttl', 'out_src_load', 'out_src_loss',
+    'out_src_header_len', 'out_src_rate', 'out_src_max_pkt',
+    'out_src_min_pkt', 'out_src_std_pkt', 'out_src_iat_total',
+    'out_src_iat_max', 'out_src_iat_min', 'out_src_psh_flags',
+    'out_src_urg_flags',
+    'out_mean_pkt_size', 'out_log_src_pkts', 'out_log_src_bytes',
+    'out_pkt_size_cv', 'out_pkt_size_range', 'out_bytes_per_sec',
+    'out_ttl_per_pkt', 'out_win_per_byte',
+]
+
+# =============================================================================
+# 1c. STEPPING-STONE FEATURE NAMESPACE
+# =============================================================================
+STEPPING_STONE_FEATURES = [
+    'ssd_avg_inter_hop_delay', 'ssd_min_inter_hop_delay',
+    'ssd_max_inter_hop_delay', 'ssd_std_inter_hop_delay',
+    'ssd_median_inter_hop_delay', 'ssd_rtt_ratio',
+    'ssd_delay_deviation', 'ssd_timing_jitter',
+    'ssd_pkt_size_correlation', 'ssd_pkt_size_match_ratio',
+    'ssd_mean_size_ratio', 'ssd_byte_count_correlation',
+    'ssd_pkt_count_match', 'ssd_byte_count_match',
+    'ssd_pkt_ratio', 'ssd_byte_ratio',
+    'ssd_throughput_ratio', 'ssd_rate_ratio',
+    'ssd_size_entropy', 'ssd_time_entropy',
+    'avg_inter_hop_delay', 'rtt_ratio',
+]
+
+# =============================================================================
+# 2. KHALID ALMINSHID ENGINE
+# =============================================================================
+class KhalidAlminshidEngine:
+    def __init__(self, w_rep=0.30, w_size=0.25, w_int=0.20, w_dst=0.15,
+                 w_byte=0.10, threshold=0.5, min_rep=2):
+        self.w_rep, self.w_size, self.w_int = w_rep, w_size, w_int
+        self.w_dst, self.w_byte = w_dst, w_byte
+        self.threshold, self.min_rep = threshold, min_rep
+
+    def score(self, df):
+        need = ['out_pkt_repetition_count', 'out_pkt_size_match',
+                'out_pkt_interval_match', 'out_pkt_same_dest_port_ratio',
+                'out_pkt_byte_match']
+        if not all(c in df.columns for c in need):
+            return np.full(len(df), 0.5)
+        rep = df['out_pkt_repetition_count'].values.astype(float)
+        sm = df['out_pkt_size_match'].clip(0, 1).values
+        im = df['out_pkt_interval_match'].clip(0, 1).values
+        sd = df['out_pkt_same_dest_port_ratio'].clip(0, 1).values
+        bm = df['out_pkt_byte_match'].clip(0, 1).values
+        rep_norm = 1.0 - np.exp(-(rep - self.min_rep).clip(0, None) / 3.0)
+        s = (self.w_rep * rep_norm + self.w_size * sm + self.w_int * im +
+             self.w_dst * sd + self.w_byte * bm)
+        match = ((rep >= self.min_rep) & (sm >= 0.8) &
+                 (im >= 0.8) & (sd >= 0.5)).astype(float)
+        return np.clip(s + 0.15 * match, 0.0, 1.0)
+
+    def flag(self, df):
+        return (self.score(df) >= self.threshold).astype(int)
+
+# =============================================================================
+# 3. KHALID ALMINSHID FLAT CLASSIFIER
+# =============================================================================
+class KhalidAlminshidClassifier:
+    def __init__(self, feature_subset=None):
+        self.feature_subset = feature_subset
+        self.engine = KhalidAlminshidEngine()
+        self.best_threshold = 0.5
+        self.majority_class = 0
+        self.has_features = False
+        self.is_fitted = False
+        self.rules, self.bins = [], {}
+        self.feature_weights = {
+            'out_pkt_repetition_count': 0.30,
+            'out_pkt_size_match': 0.25,
+            'out_pkt_interval_match': 0.20,
+            'out_pkt_same_dest_port_ratio': 0.15,
+            'out_pkt_byte_match': 0.10}
+
+    def _ok(self, X):
+        need = ['out_pkt_repetition_count', 'out_pkt_size_match',
+                'out_pkt_interval_match', 'out_pkt_same_dest_port_ratio',
+                'out_pkt_byte_match']
+        return all(c in X.columns for c in need)
+
+    def fit(self, X, y):
+        yv = y.values if isinstance(y, pd.Series) else np.asarray(y)
+        self.majority_class = int(np.argmax(np.bincount(yv.astype(int))))
+        if not self._ok(X):
+            self.has_features = False
+            self.is_fitted = True
+            return self
+        self.has_features = True
+        s = self.engine.score(X)
+        best_f1, best_t = -1, 0.5
+        for t in np.linspace(0.05, 0.95, 91):
+            p = (s >= t).astype(int)
+            f = f1_score(yv, p, zero_division=0)
+            if f > best_f1:
+                best_f1, best_t = f, float(t)
+        self.best_threshold = best_t
+        self.engine.threshold = best_t
+        for feat, w in self.feature_weights.items():
+            self.rules.append((feat, 0, 1, float(w)))
+        self.rules.sort(key=lambda x: x[3], reverse=True)
+        for feat in self.feature_weights:
+            if feat in X.columns and X[feat].nunique() > 1:
+                self.bins[feat] = np.array([float(X[feat].median())])
+            else:
+                self.bins[feat] = np.array([])
+        self.is_fitted = True
+        return self
+
+    def predict(self, X):
+        if not self.has_features:
+            return np.full(len(X), self.majority_class)
+        return (self.engine.score(X) >= self.best_threshold).astype(int)
+
+    def predict_proba(self, X):
+        if not self.has_features:
+            p = np.zeros((len(X), 2)); p[:, self.majority_class] = 1.0
+            return p
+        s = np.clip(self.engine.score(X), 0, 1)
+        return np.column_stack([1 - s, s])
+
+    def get_feature_importance(self):
+        return dict(self.feature_weights)
+
+# =============================================================================
+# 4. GRANULAR ROUGH SET LAYER
+# =============================================================================
+class GranularRoughSetLayer:
+    def __init__(self, k=4, feature_subset=None,
+                 min_granule_size=3, min_confidence=0.5):
+        self.k = k; self.feature_subset = feature_subset
+        self.min_granule_size = min_granule_size
+        self.min_confidence = min_confidence
+        self.feature_names, self.bins = [], {}
+        self.equiv_class_to_counts = {}
+        self.lower_approx, self.upper_approx = {}, {}
+        self.upper_approx_membership = {}
+        self.rules, self.rule_index = [], {}
+        self.majority_class = 0
+        self.is_fitted = False
+
+    def fit(self, X, y):
+        if isinstance(X, pd.DataFrame):
+            if self.feature_subset is not None:
+                X = X[self.feature_subset]
+            self.feature_names = X.columns.tolist()
+            Xa = X.values.astype(float)
+        else:
+            self.feature_names = [f'f{i}' for i in range(X.shape[1])]
+            Xa = np.asarray(X, dtype=float)
+        yv = y.values if isinstance(y, pd.Series) else np.asarray(y)
+        self.majority_class = int(Counter(yv.tolist()).most_common(1)[0][0])
+        self.bins = {}
+        for i, col in enumerate(self.feature_names):
+            v = Xa[:, i]; u = np.unique(v)
+            if len(u) <= 1:
+                self.bins[col] = np.array([]); continue
+            k_eff = min(self.k, max(2, len(u) - 1))
+            qs = np.linspace(0, 100, k_eff + 1)[1:-1]
+            self.bins[col] = np.unique(np.percentile(v, qs))
+        Xd = self._disc(Xa)
+        self.equiv_class_to_counts = {}
+        for r, l in zip(Xd, yv):
+            key = tuple(int(v) for v in r)
+            self.equiv_class_to_counts.setdefault(key, Counter())[int(l)] += 1
+        self.lower_approx, self.upper_approx = {}, {}
+        self.upper_approx_membership = {}
+        for key, cnts in self.equiv_class_to_counts.items():
+            tot = sum(cnts.values())
+            for c in set(int(x) for x in yv):
+                n_c = cnts.get(c, 0)
+                if n_c > 0:
+                    self.upper_approx.setdefault(c, set()).add(key)
+                    self.upper_approx_membership.setdefault(c, {})[key] = n_c / tot
+                if n_c == tot:
+                    self.lower_approx.setdefault(c, set()).add(key)
+        rv = {}
+        for key, cnts in self.equiv_class_to_counts.items():
+            tot = sum(cnts.values())
+            if tot < self.min_granule_size: continue
+            for i, b in enumerate(key):
+                col = self.feature_names[i]
+                slot = rv.setdefault((col, b), Counter())
+                for c, x in cnts.items(): slot[c] += x
+        self.rules, self.rule_index = [], {}
+        for (col, b), votes in rv.items():
+            tot = sum(votes.values())
+            if tot < self.min_granule_size: continue
+            mc, cnt = votes.most_common(1)[0]
+            conf = cnt / tot
+            if conf >= self.min_confidence:
+                self.rules.append((col, int(b), int(mc), float(conf)))
+        self.rules.sort(key=lambda x: x[3], reverse=True)
+        for (col, b, c, cf) in self.rules:
+            self.rule_index.setdefault((col, b), []).append((c, cf))
+        self.is_fitted = True
+        return self
+
+    def _disc(self, Xa):
+        out = np.zeros((Xa.shape[0], len(self.feature_names)), dtype=int)
+        for i, col in enumerate(self.feature_names):
+            e = self.bins.get(col, np.array([]))
+            out[:, i] = 0 if len(e) == 0 else np.digitize(Xa[:, i], e, right=False)
+        return out
+
+    def membership(self, Xa):
+        Xd = self._disc(Xa)
+        res = []
+        for r in Xd:
+            key = tuple(int(v) for v in r)
+            if key in self.lower_approx.get(1, set()):
+                res.append(('lower', 1.0))
+            elif key in self.upper_approx_membership.get(1, {}):
+                res.append(('boundary', self.upper_approx_membership[1][key]))
+            elif key in self.equiv_class_to_counts:
+                res.append(('benign_known', 0.0))
+            else:
+                res.append(('unseen', 0.5))
+        return res
+
+    def _to_array(self, X):
+        if isinstance(X, pd.DataFrame):
+            if self.feature_subset is not None:
+                X = X[self.feature_subset]
+            return X.values.astype(float)
+        return np.asarray(X, dtype=float)
+
+    def predict(self, X):
+        Xa = self._to_array(X)
+        res = self.membership(Xa)
+        out = np.empty(len(res), dtype=int)
+        for i, (tier, mu) in enumerate(res):
+            if tier == 'lower':
+                out[i] = 1
+            elif tier == 'benign_known':
+                out[i] = 0
+            elif tier == 'boundary':
+                out[i] = int(mu >= 0.5)
+            else:
+                out[i] = self.majority_class
+        return out
+
+    def predict_proba(self, X):
+        Xa = self._to_array(X)
+        res = self.membership(Xa)
+        out = np.empty((len(res), 2), dtype=float)
+        for i, (tier, mu) in enumerate(res):
+            if tier == 'lower':
+                out[i] = [0.0, 1.0]
+            elif tier == 'benign_known':
+                out[i] = [1.0, 0.0]
+            elif tier == 'boundary':
+                out[i] = [1.0 - mu, mu]
+            else:
+                if self.majority_class == 1:
+                    out[i] = [0.0, 1.0]
+                else:
+                    out[i] = [1.0, 0.0]
+        return out
+
+    def get_feature_importance(self):
+        imp = Counter()
+        for k, c in self.equiv_class_to_counts.items():
+            t = sum(c.values())
+            if t < self.min_granule_size: continue
+            _, top = c.most_common(1)[0]
+            if top / t < self.min_confidence: continue
+            for col in self.feature_names: imp[col] += top / t
+        return dict(imp)
+
+# =============================================================================
+# 5. KAC + GRANULAR FUSION (multi-granularity)
+# =============================================================================
+class KACGranularClassifier:
+    def __init__(self, k_values=(2, 4, 8), k_weights=(0.2, 0.5, 0.3),
+                 feature_subset=None, min_granule_size=3, min_confidence=0.5):
+        self.k_values = list(k_values)
+        self.k_weights = list(k_weights)
+        assert abs(sum(self.k_weights) - 1.0) < 1e-6
+        self.feature_subset = feature_subset
+        self.min_granule_size = min_granule_size
+        self.min_confidence = min_confidence
+        self.kac = KhalidAlminshidClassifier(feature_subset=feature_subset)
+        self.layers = {}
+        self.is_fitted = False
+
+    def fit(self, X, y):
+        self.kac.fit(X, y)
+        self.layers = {}
+        for k in self.k_values:
+            l = GranularRoughSetLayer(
+                k=k, feature_subset=self.feature_subset,
+                min_granule_size=self.min_granule_size,
+                min_confidence=self.min_confidence)
+            l.fit(X, y)
+            self.layers[k] = l
+        self.is_fitted = True
+        return self
+
+    def _decide(self, X):
+        ks = self.kac.engine.score(X)
+        kf = (ks >= self.kac.best_threshold).astype(int)
+        Xl = X[self.feature_subset] if self.feature_subset is not None else X
+        Xla = Xl.values.astype(float)
+        per_level = {}
+        for k, l in self.layers.items():
+            res = l.membership(Xla)
+            per_level[k] = {'tiers': [r[0] for r in res],
+                            'mus': np.array([r[1] for r in res])}
+        preds, tiers = [], []
+        for i in range(len(X)):
+            v1, v0 = 0.0, 0.0
+            has_def = has_pos = False
+            unseen_w = 0.0
+            for k, w in zip(self.k_values, self.k_weights):
+                t = per_level[k]['tiers'][i]
+                mu = per_level[k]['mus'][i]
+                if t == 'lower':
+                    v1 += w; has_def = True
+                elif t == 'boundary':
+                    has_pos = True; v1 += w * mu; v0 += w * (1 - mu)
+                elif t == 'benign_known':
+                    v0 += w
+                else:
+                    unseen_w += w
+                    v1 += w * ks[i]; v0 += w * (1 - ks[i])
+            if v1 + v0 == 0:
+                p = int(kf[i])
+                tl = 'definite_backdoor' if p == 1 else 'definitely_benign'
+            else:
+                p = int(v1 >= v0)
+                if has_def and not has_pos and unseen_w == 0:
+                    tl = 'definite_backdoor'
+                elif has_pos or (unseen_w > 0 and kf[i] == 1):
+                    tl = 'possible_backdoor'
+                else:
+                    tl = 'definitely_benign'
+            preds.append(p); tiers.append(tl)
+        return np.array(preds), tiers
+
+    def predict(self, X):
+        p, _ = self._decide(X); return p
+
+    def predict_proba(self, X):
+        ks = self.kac.engine.score(X)
+        Xl = X[self.feature_subset] if self.feature_subset is not None else X
+        Xla = Xl.values.astype(float)
+        per_level = {}
+        for k, l in self.layers.items():
+            res = l.membership(Xla)
+            per_level[k] = {'tiers': [r[0] for r in res],
+                            'mus': np.array([r[1] for r in res])}
+        probs = np.empty(len(X), dtype=float)
+        for i in range(len(X)):
+            v1, v0 = 0.0, 0.0
+            for k, w in zip(self.k_values, self.k_weights):
+                t = per_level[k]['tiers'][i]
+                mu = per_level[k]['mus'][i]
+                if t == 'lower':
+                    v1 += w
+                elif t == 'boundary':
+                    v1 += w * mu; v0 += w * (1 - mu)
+                elif t == 'benign_known':
+                    v0 += w
+                else:
+                    v1 += w * ks[i]; v0 += w * (1 - ks[i])
+            tot = v1 + v0
+            probs[i] = (v1 / tot) if tot > 0 else ks[i]
+        probs = np.clip(probs, 0.0, 1.0)
+        return np.column_stack([1 - probs, probs])
+
+    def predict_with_tier(self, X):
+        return self._decide(X)
+
+    @property
+    def rules(self):
+        med = self.layers.get(4) or (self.layers[min(self.layers)] if self.layers else None)
+        return med.rules if med else []
+
+    @property
+    def bins(self):
+        med = self.layers.get(4) or (self.layers[min(self.layers)] if self.layers else None)
+        return med.bins if med else {}
+
+    def get_feature_importance(self):
+        imp = Counter()
+        for k, l in self.layers.items():
+            for f, v in l.get_feature_importance().items():
+                imp[f] += v
+        for f, w in self.kac.feature_weights.items():
+            imp[f] += w
+        return dict(imp)
+
+# =============================================================================
+# 6. ROUGH SET (ALONE)
+# =============================================================================
+class RoughSetClassifier:
+    def __init__(self, n_bins=8, feature_subset=None, min_class_size=3,
+                 min_samples_per_bin=5, min_confidence=0.5):
+        self.n_bins = n_bins; self.feature_subset = feature_subset
+        self.min_class_size = min_class_size
+        self.min_samples_per_bin = min_samples_per_bin
+        self.min_confidence = min_confidence
+        self.bins, self.feature_names = {}, []
+        self.equiv_class_to_counts = {}
+        self.lower_approx, self.upper_approx = {}, {}
+        self.upper_approx_membership = {}
+        self.rules, self.rule_index = [], {}
+        self.majority_class = 0; self.is_fitted = False
+
+    def fit(self, X, y):
+        if isinstance(X, pd.DataFrame):
+            if self.feature_subset is not None:
+                X = X[self.feature_subset]
+            self.feature_names = X.columns.tolist()
+            Xa = X.values.astype(float)
+        else:
+            self.feature_names = [f'f{i}' for i in range(X.shape[1])]
+            Xa = np.asarray(X, dtype=float)
+        y = y.values if isinstance(y, pd.Series) else np.asarray(y)
+        self.majority_class = int(Counter(y.tolist()).most_common(1)[0][0])
+        self.bins = {}
+        for i, col in enumerate(self.feature_names):
+            v = Xa[:, i]; u = np.unique(v)
+            if len(u) <= 1: self.bins[col] = np.array([]); continue
+            nb = min(self.n_bins, max(2, len(u) - 1))
+            qs = np.linspace(0, 100, nb + 1)[1:-1]
+            self.bins[col] = np.unique(np.percentile(v, qs))
+        Xd = self._disc(Xa)
+        self.equiv_class_to_counts = {}
+        for r, l in zip(Xd, y):
+            key = tuple(int(v) for v in r)
+            self.equiv_class_to_counts.setdefault(key, Counter())[int(l)] += 1
+        self.lower_approx, self.upper_approx = {}, {}
+        self.upper_approx_membership = {}
+        for key, cnts in self.equiv_class_to_counts.items():
+            tot = sum(cnts.values())
+            for c in set(int(x) for x in y):
+                n_c = cnts.get(c, 0)
+                if n_c > 0:
+                    self.upper_approx.setdefault(c, set()).add(key)
+                    self.upper_approx_membership.setdefault(c, {})[key] = n_c / tot
+                if n_c == tot:
+                    self.lower_approx.setdefault(c, set()).add(key)
+        rv = {}
+        for key, cnts in self.equiv_class_to_counts.items():
+            tot = sum(cnts.values())
+            if tot < self.min_class_size: continue
+            for i, b in enumerate(key):
+                col = self.feature_names[i]
+                slot = rv.setdefault((col, b), Counter())
+                for c, x in cnts.items(): slot[c] += x
+        self.rules, self.rule_index = [], {}
+        for (col, b), votes in rv.items():
+            tot = sum(votes.values())
+            if tot < self.min_samples_per_bin: continue
+            mc, cnt = votes.most_common(1)[0]
+            cf = cnt / tot
+            if cf >= self.min_confidence:
+                self.rules.append((col, b, int(mc), float(cf)))
+        self.rules.sort(key=lambda x: x[3], reverse=True)
+        for (col, b, c, cf) in self.rules:
+            self.rule_index.setdefault((col, b), []).append((c, cf))
+        self.is_fitted = True
+        return self
+
+    def _disc(self, Xa):
+        out = np.zeros((Xa.shape[0], len(self.feature_names)), dtype=int)
+        for i, col in enumerate(self.feature_names):
+            e = self.bins.get(col, np.array([]))
+            out[:, i] = 0 if len(e) == 0 else np.digitize(Xa[:, i], e, right=False)
+        return out
+
+    def _vote(self, key):
+        v = Counter()
+        for i, b in enumerate(key):
+            col = self.feature_names[i]
+            for (c, cf) in self.rule_index.get((col, b), []):
+                v[c] += cf
+        return v.most_common(1)[0][0] if v else self.majority_class
+
+    def _classify(self, key):
+        for c, ks in self.lower_approx.items():
+            if key in ks: return c
+        best, bm = self.majority_class, -1.0
+        for c, km in self.upper_approx_membership.items():
+            if key in km and km[key] > bm:
+                bm, best = km[key], c
+        return best if bm > 0 else self._vote(key)
+
+    def predict(self, X):
+        if isinstance(X, pd.DataFrame):
+            if self.feature_subset is not None:
+                X = X[self.feature_subset]
+            Xa = X.values.astype(float)
+        else:
+            Xa = np.asarray(X, dtype=float)
+        Xd = self._disc(Xa)
+        return np.array([self._classify(tuple(int(v) for v in r)) for r in Xd])
+
+    def predict_proba(self, X):
+        if isinstance(X, pd.DataFrame):
+            if self.feature_subset is not None:
+                X = X[self.feature_subset]
+            Xa = X.values.astype(float)
+        else:
+            Xa = np.asarray(X, dtype=float)
+        Xd = self._disc(Xa)
+        out = []
+        for r in Xd:
+            key = tuple(int(v) for v in r)
+            m0 = self.upper_approx_membership.get(0, {}).get(key, 0.0)
+            m1 = self.upper_approx_membership.get(1, {}).get(key, 0.0)
+            t = m0 + m1
+            out.append([m0 / t, m1 / t] if t > 0 else [0.5, 0.5])
+        return np.array(out)
+
+    def get_feature_importance(self):
+        imp = Counter()
+        for k, c in self.equiv_class_to_counts.items():
+            t = sum(c.values())
+            if t < self.min_class_size: continue
+            _, top = c.most_common(1)[0]
+            if top / t < self.min_confidence: continue
+            for col in self.feature_names: imp[col] += top / t
+        return dict(imp)
+
+# =============================================================================
+# 7. SSD BASELINES
+# =============================================================================
+class SSDOnly:
+    def __init__(self):
+        self.fitted = False; self.has_features = False
+        self.majority_class = 0
+    def fit(self, X, y):
+        req = ['avg_inter_hop_delay', 'rtt_ratio']
+        self.has_features = all(c in X.columns for c in req)
+        yv = y.values if isinstance(y, pd.Series) else np.asarray(y)
+        if not self.has_features:
+            self.majority_class = int(np.argmax(np.bincount(yv)))
+            self.fitted = True; return self
+        d = X['avg_inter_hop_delay'].values; r = X['rtt_ratio'].values
+        best_f1, best = -1, (None, None)
+        for td in np.linspace(d.min(), d.max(), 20):
+            for tr in np.linspace(r.min(), r.max(), 20):
+                p = ((d > td) | (r > tr)).astype(int)
+                f = f1_score(yv, p, zero_division=0)
+                if f > best_f1: best_f1, best = f, (td, tr)
+        self.td, self.tr = best; self.fitted = True; return self
+    def predict(self, X):
+        if not self.has_features:
+            return np.full(len(X), self.majority_class)
+        d = X['avg_inter_hop_delay'].values; r = X['rtt_ratio'].values
+        return ((d > self.td) | (r > self.tr)).astype(int)
+    def predict_proba(self, X):
+        p = self.predict(X); return np.column_stack([1 - p, p])
+
+class SSDAllClassifier:
+    def __init__(self, feature_subset=None):
+        self.feature_subset = feature_subset
+        self.threshold = 0.5
+        self.majority_class = 0
+        self.weights = {}
+        self.means = None
+        self.stds = None
+        self.feats = []
+        self.is_fitted = False
+
+    def fit(self, X, y):
+        yv = y.values if isinstance(y, pd.Series) else np.asarray(y)
+        self.majority_class = int(np.argmax(np.bincount(yv.astype(int))))
+        feats = self.feature_subset if self.feature_subset is not None else \
+                [c for c in STEPPING_STONE_FEATURES if c in X.columns]
+        feats = [f for f in feats if f in X.columns]
+        if not feats:
+            self.is_fitted = True
+            return self
+        Xs = X[feats].astype(float)
+        self.means = Xs.mean()
+        self.stds = Xs.std().replace(0, 1).fillna(1)
+        Z = ((Xs - self.means) / self.stds).fillna(0)
+        w = {}
+        for f in feats:
+            m0 = Z[yv == 0][f].mean() if (yv == 0).any() else 0.0
+            m1 = Z[yv == 1][f].mean() if (yv == 1).any() else 0.0
+            w[f] = float(abs(m1 - m0))
+        tot = sum(w.values()) or 1.0
+        self.weights = {k: v / tot for k, v in w.items()}
+        self.feats = feats
+        s = self._score(Xs)
+        best_f1, best_t = -1, float(np.median(s))
+        for t in np.linspace(s.min(), s.max(), 101):
+            p = (s >= t).astype(int)
+            f = f1_score(yv, p, zero_division=0)
+            if f > best_f1:
+                best_f1, best_t = f, float(t)
+        self.threshold = best_t
+        self.is_fitted = True
+        return self
+
+    def _score(self, Xs):
+        Z = ((Xs[self.feats] - self.means) / self.stds).fillna(0)
+        s = np.zeros(len(Z))
+        for f, w in self.weights.items():
+            s += w * np.abs(Z[f].values)
+        return s
+
+    def predict(self, X):
+        if not self.is_fitted or not self.weights:
+            return np.full(len(X), self.majority_class)
+        s = self._score(X)
+        return (s >= self.threshold).astype(int)
+
+    def predict_proba(self, X):
+        if not self.is_fitted or not self.weights:
+            p = np.zeros((len(X), 2)); p[:, self.majority_class] = 1.0
+            return p
+        s = self._score(X)
+        rng = abs(self.threshold) + 1e-6
+        s_norm = np.clip((s - self.threshold) / rng * 0.5 + 0.5, 0, 1)
+        return np.column_stack([1 - s_norm, s_norm])
+
+    def get_feature_importance(self):
+        return dict(self.weights)
+
+# =============================================================================
+# 8. SYNTHETIC DATA GENERATOR
+# =============================================================================
+def _kac_from_chain(chain, is_mal, kac_mean_mal=0.92, kac_std_mal=0.05,
+                    kac_mean_ben=0.25, kac_std_ben=0.15):
+    if is_mal:
+        rep = np.random.randint(4, 9)
+        sm = float(np.clip(np.random.normal(kac_mean_mal, kac_std_mal), 0, 1))
+        im = float(np.clip(np.random.normal(kac_mean_mal, kac_std_mal), 0, 1))
+        sd = float(np.clip(np.random.normal(kac_mean_mal, kac_std_mal), 0, 1))
+        bm = float(np.clip(np.random.normal(kac_mean_mal, kac_std_mal), 0, 1))
+    else:
+        rep = int(np.random.choice([0, 1, 1, 2], p=[0.4, 0.35, 0.15, 0.10]))
+        sm = float(np.clip(np.random.normal(kac_mean_ben, kac_std_ben), 0, 1))
+        im = float(np.clip(np.random.normal(kac_mean_ben, kac_std_ben), 0, 1))
+        sd = float(np.clip(np.random.normal(kac_mean_ben, kac_std_ben), 0, 1))
+        bm = float(np.clip(np.random.normal(kac_mean_ben, kac_std_ben), 0, 1))
+    engine = KhalidAlminshidEngine()
+    tmp = pd.DataFrame([{'out_pkt_repetition_count': rep,
+                         'out_pkt_size_match': sm, 'out_pkt_interval_match': im,
+                         'out_pkt_same_dest_port_ratio': sd, 'out_pkt_byte_match': bm}])
+    risk = float(engine.score(tmp)[0])
+    s_pkts = float(rep if rep > 0 else np.random.randint(1, 5))
+    s_bytes = float(s_pkts * np.random.uniform(40, 400))
+    return {
+        'out_pkt_repetition_count': float(rep),
+        'out_pkt_size_match': sm, 'out_pkt_interval_match': im,
+        'out_pkt_same_dest_port_ratio': sd, 'out_pkt_byte_match': bm,
+        'khalid_risk_score': risk,
+        'out_src_pkts': s_pkts,
+        'out_src_bytes': s_bytes,
+        'out_src_mean_size': float(s_bytes / s_pkts),
+        'out_src_inter_pkt': float(np.random.exponential(0.5 if is_mal else 5.0)),
+        'out_src_jitter': float(np.random.exponential(0.2 if is_mal else 2.0)),
+        'out_src_win': float(np.random.randint(0, 65535)),
+        'out_src_tcp_base': float(np.random.randint(0, 2**32)),
+        'out_src_ttl': float(np.random.choice([32, 64, 128, 255])),
+        'out_src_load': float(np.random.uniform(0, 1e6)),
+        'out_src_loss': float(np.random.uniform(0, 1)),
+        'out_src_header_len': float(np.random.uniform(20, 60)),
+        'out_src_rate': float(np.random.uniform(0, 1000)),
+        'out_src_max_pkt': float(np.random.uniform(40, 1500)),
+        'out_src_min_pkt': float(np.random.uniform(0, 40)),
+        'out_src_std_pkt': float(np.random.uniform(0, 100)),
+        'out_src_iat_total': float(np.random.exponential(2.0)),
+        'out_src_iat_max': float(np.random.exponential(1.0)),
+        'out_src_iat_min': float(np.random.exponential(0.05)),
+        'out_src_psh_flags': float(np.random.randint(0, 5)),
+        'out_src_urg_flags': float(np.random.randint(0, 3)),
+        'spkts': s_pkts,
+        'dpkts': float(np.random.randint(1, 5)),
+        'sbytes': s_bytes,
+        'dbytes': float(np.random.randint(40, 4000)),
+        'smean': float(s_bytes / s_pkts),
+        'dmean': float(np.random.uniform(40, 400)),
+        'sinpkt': float(np.random.exponential(0.5 if is_mal else 5.0)),
+        'dinpkt': float(np.random.exponential(0.5 if is_mal else 5.0)),
+        'fwd_iat_mean': float(np.random.exponential(0.5 if is_mal else 5.0)),
+        'fwd_iat_std': float(np.random.exponential(0.2 if is_mal else 2.0)),
+        'bwd_iat_std': float(np.random.exponential(0.2 if is_mal else 2.0)),
+        'fwd_pkt_len_std': float(np.random.uniform(0, 100)),
+        'bwd_pkt_len_std': float(np.random.uniform(0, 100)),
+        'sload': float(np.random.uniform(0, 1e6)),
+        'dload': float(np.random.uniform(0, 1e6)),
+        'srate': float(np.random.uniform(0, 1000)),
+        'drate': float(np.random.uniform(0, 1000)),
+    }
+
+def generate_dataset(num_samples=10000, attack_ratio=0.20, difficulty='very_hard',
+                     random_state=42):
+    presets = {
+        'hard':      {'kac_mal_mean': 0.90, 'kac_std': 0.05, 'kac_ben_mean': 0.20},
+        'very_hard': {'kac_mal_mean': 0.80, 'kac_std': 0.10, 'kac_ben_mean': 0.35},
+        'extreme':   {'kac_mal_mean': 0.68, 'kac_std': 0.14, 'kac_ben_mean': 0.50},
+    }
+    p = presets.get(difficulty, presets['very_hard'])
+    np.random.seed(random_state)
+    rows = []
+    for _ in range(num_samples):
+        is_mal = np.random.random() < attack_ratio
+        chain = [{'delay': np.random.uniform(0.02, 1.5),
+                  'duration': np.random.exponential(1.2 if is_mal else 100),
+                  'pkt_in': np.random.poisson(10), 'pkt_out': np.random.poisson(10),
+                  'bytes_in': np.random.randint(20, 200) if is_mal else np.random.randint(200, 9000),
+                  'bytes_out': np.random.randint(20, 200) if is_mal else np.random.randint(200, 9000)}
+                 for _ in range(np.random.randint(1, 8))]
+        ka = _kac_from_chain(chain, is_mal, p['kac_mal_mean'], p['kac_std'],
+                             p['kac_ben_mean'], p['kac_std'])
+        row = dict(ka)
+        row['avg_inter_hop_delay'] = np.mean([h['delay'] for h in chain])
+        row['rtt_ratio'] = np.random.uniform(0.1, 4.0)
+        row['num_hops'] = len(chain)
+        row['label'] = int(is_mal)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+# =============================================================================
+# 9. REAL DATA LOADER
+# =============================================================================
+def load_folder(folder):
+    csvs = glob.glob(os.path.join(folder, '*.csv'))
+    skip = ['feature', 'list_events', 'description', 'readme']
+    files = [f for f in csvs if not any(p in os.path.basename(f).lower() for p in skip)]
+    frames = []
+    for f in files:
+        print(f"   - {os.path.basename(f)}")
+        try: df = pd.read_csv(f)
+        except: continue
+        if df.empty or len(df.columns) < 5: continue
+        frames.append(df)
+    df = pd.concat(frames, ignore_index=True)
+    print(f"   Combined: {df.shape}")
+    cand = ['label', 'labels', 'class', 'attack_cat', 'attack',
+            'malicious', 'target', 'type']
+    cs = {c.strip().lower(): c for c in df.columns}
+    lc = next((cs[n] for n in cand if n in cs), None)
+    if lc and lc != 'label': df.rename(columns={lc: 'label'}, inplace=True)
+    benign = {'benign', 'normal', 'good', '0', 'false', 'no'}
+    def b(v):
+        if pd.isna(v): return np.nan
+        x = str(v).strip().lower()
+        if x == '': return np.nan
+        if x in benign: return 0
+        try:
+            if float(x) == 0: return 0
+        except: pass
+        return 1
+    df['label'] = df['label'].astype(str).apply(b)
+    df = df.dropna(subset=['label'])
+    df['label'] = df['label'].astype(int)
+    print(f"   Labels: {df['label'].value_counts().to_dict()}")
+    return df
+
+# =============================================================================
+# 10. FEATURE DERIVATION
+# =============================================================================
+def derive_kac_features(df):
+    """Derive KAC + outgoing features with normalised column matching."""
+    df = df.copy()
+    cols = {_norm(c): c for c in df.columns}
+
+    def pick(candidates):
+        for c in candidates:
+            key = _norm(c)
+            if key in cols:
+                return df[cols[key]]
+        return None
+
+    for new_name, cands in OUTGOING_SOURCE_MAP.items():
+        if new_name in df.columns:
+            continue
+        s = pick(cands)
+        if s is not None:
+            df[new_name] = pd.to_numeric(s, errors='coerce').fillna(0).astype(float)
+
+    if 'out_pkt_repetition_count' not in df.columns:
+        if 'out_src_pkts' in df.columns:
+            df['out_pkt_repetition_count'] = df['out_src_pkts'].clip(lower=0)
+        else:
+            df['out_pkt_repetition_count'] = 1.0
+    rep = df['out_pkt_repetition_count'].astype(float).clip(lower=1)
+
+    if 'out_pkt_size_match' not in df.columns:
+        if 'out_src_mean_size' in df.columns:
+            ms = df['out_src_mean_size'].astype(float).abs()
+            df['out_pkt_size_match'] = (1.0 / (1.0 + ms / 1000.0)).clip(0, 1)
+        elif 'out_src_bytes' in df.columns:
+            ms = (df['out_src_bytes'].astype(float) / rep).abs()
+            df['out_pkt_size_match'] = (1.0 / (1.0 + ms / 1000.0)).clip(0, 1)
+        else:
+            df['out_pkt_size_match'] = 0.5
+
+    if 'out_pkt_interval_match' not in df.columns:
+        if 'out_src_inter_pkt' in df.columns:
+            x = df['out_src_inter_pkt'].astype(float).fillna(0).clip(lower=0)
+            df['out_pkt_interval_match'] = np.exp(-x / 100.0).clip(0, 1)
+        else:
+            df['out_pkt_interval_match'] = 0.5
+
+    if 'out_pkt_same_dest_port_ratio' not in df.columns:
+        c = pick(['ct_dst_sport_ltm', 'ct_dst_ltm', 'same_dst_port_ratio',
+                  'dst_host_same_src_port_rate',
+                  'dst_host_same_src_port_rate_'])
+        if c is not None:
+            x = pd.to_numeric(c, errors='coerce').fillna(0).clip(lower=0)
+            df['out_pkt_same_dest_port_ratio'] = (1.0 - np.exp(-x / 10.0)).clip(0, 1)
+        else:
+            df['out_pkt_same_dest_port_ratio'] = (1.0 - np.exp(-rep / 20.0)).clip(0, 1)
+
+    if 'out_pkt_byte_match' not in df.columns:
+        if 'out_src_bytes' in df.columns:
+            bpp = (df['out_src_bytes'].astype(float) / rep).abs()
+            df['out_pkt_byte_match'] = (1.0 / (1.0 + bpp / 1000.0)).clip(0, 1)
+        else:
+            df['out_pkt_byte_match'] = 0.5
+
+    p = df.get('out_src_pkts', pd.Series(1.0, index=df.index)).astype(float).clip(lower=1)
+    b = df.get('out_src_bytes', pd.Series(0.0, index=df.index)).astype(float)
+
+    if 'out_mean_pkt_size' not in df.columns:
+        df['out_mean_pkt_size'] = (b / p)
+    if 'out_log_src_pkts' not in df.columns:
+        df['out_log_src_pkts'] = np.log1p(p.clip(lower=0))
+    if 'out_log_src_bytes' not in df.columns:
+        df['out_log_src_bytes'] = np.log1p(b.clip(lower=0))
+    if 'out_pkt_size_cv' not in df.columns:
+        if 'out_src_std_pkt' in df.columns:
+            df['out_pkt_size_cv'] = (
+                df['out_src_std_pkt'].astype(float) /
+                (df['out_mean_pkt_size'].abs() + 1.0))
+        else:
+            df['out_pkt_size_cv'] = 0.0
+    if 'out_pkt_size_range' not in df.columns:
+        if 'out_src_max_pkt' in df.columns and 'out_src_min_pkt' in df.columns:
+            df['out_pkt_size_range'] = (
+                df['out_src_max_pkt'].astype(float) -
+                df['out_src_min_pkt'].astype(float))
+        else:
+            df['out_pkt_size_range'] = 0.0
+    if 'out_bytes_per_sec' not in df.columns:
+        df['out_bytes_per_sec'] = df.get('out_src_load', b)
+    if 'out_ttl_per_pkt' not in df.columns:
+        df['out_ttl_per_pkt'] = (
+            df.get('out_src_ttl', pd.Series(0.0, index=df.index)).astype(float) / p)
+    if 'out_win_per_byte' not in df.columns:
+        df['out_win_per_byte'] = (
+            df.get('out_src_win', pd.Series(0.0, index=df.index)).astype(float) / (b + 1.0))
+
+    if 'khalid_risk_score' not in df.columns:
+        engine = KhalidAlminshidEngine()
+        df['khalid_risk_score'] = engine.score(df)
+
+    for c in df.columns:
+        if df[c].dtype.kind in 'fc':
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    found = [f for f in OUTGOING_SOURCE_MAP if f in df.columns]
+    print(f"   [derive] raw outgoing columns found: {len(found)} → {found}")
+    const_flags = []
+    for f in ['out_pkt_repetition_count', 'out_pkt_size_match',
+              'out_pkt_interval_match', 'out_pkt_same_dest_port_ratio',
+              'out_pkt_byte_match']:
+        if f in df.columns and df[f].nunique() <= 1:
+            const_flags.append(f"{f}={df[f].iloc[0]}")
+    if const_flags:
+        print(f"   ⚠️  CONSTANT KAC features (KAC score may collapse): "
+              f"{const_flags}")
+    else:
+        print("   ✅ All KAC features are non-constant")
+
+    return df
+
+
+def derive_stepping_stone_features(df):
+    """Derive all classical SSD features into ssd_* namespace."""
+    df = df.copy()
+    cols = {_norm(c): c for c in df.columns}
+
+    def pick(candidates):
+        for c in candidates:
+            key = _norm(c)
+            if key in cols:
+                return pd.to_numeric(df[cols[key]], errors='coerce').fillna(0)
+        return None
+
+    s_iat_mean = pick(['sinpkt', 'src_inter_pkt', 'fwd_iat_mean',
+                       'flow_iat_mean', 'mean_time_between_fwd_packets',
+                       'out_src_inter_pkt'])
+    s_iat_min  = pick(['fwd_iat_min', 'min_time_between_fwd_packets',
+                       'flow_iat_min', 'out_src_iat_min'])
+    s_iat_max  = pick(['fwd_iat_max', 'max_time_between_fwd_packets',
+                       'flow_iat_max', 'out_src_iat_max'])
+    s_iat_std  = pick(['fwd_iat_std', 'std_time_between_fwd_packets',
+                       'out_src_jitter', 'flow_iat_std'])
+    s_pkts     = pick(['spkts', 'src_pkts', 'fwd_packets',
+                       'total_fwd_packets', 'out_src_pkts'])
+    s_bytes    = pick(['sbytes', 'src_bytes', 'fwd_bytes',
+                       'total_length_of_fwd_packets', 'out_src_bytes'])
+    s_mean     = pick(['smean', 'fwd_pkt_len_mean', 'out_src_mean_size',
+                       'average_packet_size'])
+    s_std      = pick(['fwd_pkt_len_std', 'out_src_std_pkt',
+                       'fwd_packet_length_std'])
+    s_jit      = pick(['sjit', 'out_src_jitter'])
+    s_load     = pick(['sload', 'out_src_load'])
+    s_rate     = pick(['srate', 'fwd_pkts_s', 'out_src_rate'])
+
+    d_iat_mean = pick(['dinpkt', 'dst_inter_pkt', 'bwd_iat_mean',
+                       'mean_time_between_bwd_packets'])
+    d_pkts     = pick(['dpkts', 'dst_pkts', 'bwd_packets',
+                       'total_backward_packets'])
+    d_bytes    = pick(['dbytes', 'dst_bytes', 'bwd_bytes',
+                       'total_length_of_bwd_packets'])
+    d_mean     = pick(['dmean', 'bwd_pkt_len_mean'])
+    d_std      = pick(['bwd_pkt_len_std'])
+    d_jit      = pick(['djit', 'bwd_iat_std'])
+    d_load     = pick(['dload'])
+    d_rate     = pick(['drate', 'bwd_pkts_s'])
+
+    if 'ssd_avg_inter_hop_delay' not in df.columns:
+        if s_iat_mean is not None:
+            df['ssd_avg_inter_hop_delay'] = s_iat_mean.clip(lower=0)
+        elif 'avg_inter_hop_delay' in df.columns:
+            df['ssd_avg_inter_hop_delay'] = df['avg_inter_hop_delay'].astype(float)
+        else:
+            df['ssd_avg_inter_hop_delay'] = 0.0
+    if 'avg_inter_hop_delay' not in df.columns:
+        df['avg_inter_hop_delay'] = df['ssd_avg_inter_hop_delay']
+
+    if 'ssd_min_inter_hop_delay' not in df.columns:
+        df['ssd_min_inter_hop_delay'] = (s_iat_min.clip(lower=0)
+            if s_iat_min is not None
+            else df['ssd_avg_inter_hop_delay'] * 0.5)
+    if 'ssd_max_inter_hop_delay' not in df.columns:
+        df['ssd_max_inter_hop_delay'] = (s_iat_max.clip(lower=0)
+            if s_iat_max is not None
+            else df['ssd_avg_inter_hop_delay'] * 2.0)
+    if 'ssd_std_inter_hop_delay' not in df.columns:
+        df['ssd_std_inter_hop_delay'] = (s_iat_std.clip(lower=0)
+            if s_iat_std is not None else 0.0)
+    if 'ssd_median_inter_hop_delay' not in df.columns:
+        df['ssd_median_inter_hop_delay'] = df['ssd_avg_inter_hop_delay']
+
+    if 'ssd_rtt_ratio' not in df.columns:
+        if 'rtt_ratio' in df.columns:
+            df['ssd_rtt_ratio'] = df['rtt_ratio'].astype(float)
+        elif d_iat_mean is not None and s_iat_mean is not None:
+            df['ssd_rtt_ratio'] = (
+                d_iat_mean.clip(lower=1e-6) / s_iat_mean.clip(lower=1e-6)
+            ).clip(upper=100)
+        elif d_jit is not None and s_jit is not None:
+            df['ssd_rtt_ratio'] = (
+                d_jit.clip(lower=1e-6) / s_jit.clip(lower=1e-6)
+            ).clip(upper=100)
+        else:
+            df['ssd_rtt_ratio'] = 1.0
+    if 'rtt_ratio' not in df.columns:
+        df['rtt_ratio'] = df['ssd_rtt_ratio']
+
+    if 'ssd_delay_deviation' not in df.columns:
+        df['ssd_delay_deviation'] = (
+            df['ssd_std_inter_hop_delay'] /
+            df['ssd_avg_inter_hop_delay'].clip(lower=1e-6)
+        ).clip(upper=100)
+    if 'ssd_timing_jitter' not in df.columns:
+        df['ssd_timing_jitter'] = (s_jit.clip(lower=0)
+            if s_jit is not None else df['ssd_std_inter_hop_delay'])
+
+    if 'ssd_mean_size_ratio' not in df.columns:
+        if d_mean is not None and s_mean is not None:
+            df['ssd_mean_size_ratio'] = (
+                s_mean.clip(lower=1e-6) / d_mean.clip(lower=1e-6)
+            ).clip(upper=1000)
+        elif d_bytes is not None and s_bytes is not None and \
+                d_pkts is not None and s_pkts is not None:
+            df['ssd_mean_size_ratio'] = (
+                (s_bytes / s_pkts.clip(lower=1)) /
+                (d_bytes / d_pkts.clip(lower=1)).clip(lower=1e-6)
+            ).clip(upper=1000)
+        else:
+            df['ssd_mean_size_ratio'] = 1.0
+
+    if 'ssd_pkt_size_match_ratio' not in df.columns:
+        r = df['ssd_mean_size_ratio'].clip(lower=1e-6)
+        df['ssd_pkt_size_match_ratio'] = (
+            1.0 / (1.0 + np.abs(np.log(r)))).clip(0, 1)
+
+    if 'ssd_pkt_size_correlation' not in df.columns:
+        if s_std is not None and d_std is not None:
+            df['ssd_pkt_size_correlation'] = (
+                1.0 / (1.0 + (s_std - d_std).abs())).clip(0, 1)
+        else:
+            df['ssd_pkt_size_correlation'] = df['ssd_pkt_size_match_ratio']
+
+    if 'ssd_byte_count_correlation' not in df.columns:
+        if s_bytes is not None and d_bytes is not None:
+            num = (s_bytes - d_bytes).abs()
+            den = (s_bytes + d_bytes).clip(lower=1)
+            df['ssd_byte_count_correlation'] = (1.0 - num / den).clip(0, 1)
+        else:
+            df['ssd_byte_count_correlation'] = 0.5
+
+    if 'ssd_pkt_ratio' not in df.columns:
+        if s_pkts is not None and d_pkts is not None:
+            df['ssd_pkt_ratio'] = (
+                s_pkts.clip(lower=1) / d_pkts.clip(lower=1)
+            ).clip(upper=1000)
+        else:
+            df['ssd_pkt_ratio'] = 1.0
+    if 'ssd_byte_ratio' not in df.columns:
+        if s_bytes is not None and d_bytes is not None:
+            df['ssd_byte_ratio'] = (
+                s_bytes.clip(lower=1) / d_bytes.clip(lower=1)
+            ).clip(upper=1000)
+        else:
+            df['ssd_byte_ratio'] = 1.0
+    if 'ssd_pkt_count_match' not in df.columns:
+        r = df['ssd_pkt_ratio'].clip(lower=1e-6)
+        df['ssd_pkt_count_match'] = (1.0 / (1.0 + np.abs(np.log(r)))).clip(0, 1)
+    if 'ssd_byte_count_match' not in df.columns:
+        r = df['ssd_byte_ratio'].clip(lower=1e-6)
+        df['ssd_byte_count_match'] = (1.0 / (1.0 + np.abs(np.log(r)))).clip(0, 1)
+
+    if 'ssd_throughput_ratio' not in df.columns:
+        if s_load is not None and d_load is not None:
+            df['ssd_throughput_ratio'] = (
+                s_load.clip(lower=1e-6) / d_load.clip(lower=1e-6)
+            ).clip(upper=1000)
+        else:
+            df['ssd_throughput_ratio'] = 1.0
+    if 'ssd_rate_ratio' not in df.columns:
+        if s_rate is not None and d_rate is not None:
+            df['ssd_rate_ratio'] = (
+                s_rate.clip(lower=1e-6) / d_rate.clip(lower=1e-6)
+            ).clip(upper=1000)
+        else:
+            df['ssd_rate_ratio'] = 1.0
+
+    if 'ssd_size_entropy' not in df.columns:
+        if s_std is not None:
+            var = (s_std ** 2).clip(lower=1e-6)
+            df['ssd_size_entropy'] = 0.5 * np.log(2 * np.pi * np.e * var)
+        else:
+            df['ssd_size_entropy'] = 0.0
+    if 'ssd_time_entropy' not in df.columns:
+        if s_iat_std is not None:
+            var = (s_iat_std ** 2).clip(lower=1e-6)
+            df['ssd_time_entropy'] = 0.5 * np.log(2 * np.pi * np.e * var)
+        else:
+            df['ssd_time_entropy'] = 0.0
+
+    for c in df.columns:
+        if df[c].dtype.kind in 'fc':
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return df
+
+# =============================================================================
+# 11. PREP + PLOT + RULE UTILS  (with expanded label-drop list)
+# =============================================================================
+# ---- FIX 1: drop ALL label-like columns to eliminate tree-model leak ----
+LABEL_LIKE_COLUMNS = [
+    'Unnamed: 0', 'index', 'id',
+    # primary label (already renamed to 'label' but be safe)
+    'label', 'labels',
+    # alternative label columns seen across datasets
+    'attack_cat', 'attack', 'attack_type', 'attack_category',
+    'attack_subcategory', 'class', 'class_name', 'category',
+    'subcategory', 'target', 'type', 'malicious', 'is_malicious',
+    'is_attack', 'is_anomaly', 'anomaly', 'label_name', 'label_binary',
+    'label_multiclass', 'attack_name', 'attack_label',
+    # identifiers that can leak
+    'flow_id', 'session_id', 'connection_id', 'record_id',
+    'source_file', 'dataset', 'split',
+]
+
+def prep(X):
+    for c in LABEL_LIKE_COLUMNS:
+        if c in X.columns:
+            X = X.drop(columns=[c])
+    cat = X.select_dtypes(include=['object']).columns.tolist()
+    Xe = X.copy()
+    for c in cat:
+        n = X[c].nunique()
+        if n <= 1: Xe = Xe.drop(columns=[c])
+        elif n <= 50:
+            d = pd.get_dummies(X[c], prefix=c, drop_first=True)
+            Xe = pd.concat([Xe.drop(columns=[c]), d], axis=1)
+        else:
+            fr = X[c].value_counts(normalize=True)
+            Xe[c] = X[c].map(fr).fillna(0)
+    return Xe.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+def plot_roc(y, pr, path):
+    plt.figure(figsize=(9, 7))
+    for n, p in pr.items():
+        if p is None: continue
+        p1 = p[:, 1] if p.shape[1] == 2 else p[:, 0]
+        fpr, tpr, _ = roc_curve(y, p1)
+        plt.plot(fpr, tpr, label=f'{n} ({roc_auc_score(y, p1):.3f})', lw=2)
+    plt.plot([0, 1], [0, 1], 'k--'); plt.xlabel('FPR'); plt.ylabel('TPR')
+    plt.title('ROC — Paper 2 (KAC + Granular + SSD)')
+    plt.legend(loc='lower right', fontsize=7); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(path, dpi=300); plt.close()
+
+def plot_pr(y, pr, path):
+    plt.figure(figsize=(9, 7))
+    for n, p in pr.items():
+        if p is None: continue
+        p1 = p[:, 1] if p.shape[1] == 2 else p[:, 0]
+        prc, rc, _ = precision_recall_curve(y, p1)
+        plt.plot(rc, prc, label=f'{n} ({average_precision_score(y, p1):.3f})', lw=2)
+    plt.xlabel('Recall'); plt.ylabel('Precision')
+    plt.title('PR — Paper 2 (KAC + Granular + SSD)')
+    plt.legend(loc='lower left', fontsize=7); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(path, dpi=300); plt.close()
+
+def plot_cm(y, preds, names, path):
+    n = len(names); c = min(3, n); r = int(np.ceil(n / c))
+    fig, axes = plt.subplots(r, c, figsize=(5 * c, 4 * r))
+    axes = np.array(axes).flatten() if n > 1 else np.array([axes])
+    i = 0
+    for i, nm in enumerate(names):
+        if nm not in preds: continue
+        cm = confusion_matrix(y, preds[nm], normalize='true')
+        sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', cbar=False,
+                    ax=axes[i], xticklabels=['Benign', 'Attack'],
+                    yticklabels=['Benign', 'Attack'])
+        axes[i].set_title(nm, fontsize=8)
+    for j in range(i + 1, len(axes)): axes[j].axis('off')
+    plt.tight_layout(); plt.savefig(path, dpi=300); plt.close()
+
+def plot_imp(clf, title, path):
+    imp = clf.get_feature_importance()
+    if not imp: return
+    s = sorted(imp.items(), key=lambda x: x[1], reverse=True)[:25]
+    f, v = zip(*s)
+    plt.figure(figsize=(10, 7)); plt.barh(f, v); plt.xlabel('Importance')
+    plt.title(title); plt.tight_layout(); plt.savefig(path, dpi=300); plt.close()
+
+def extract_rules(clf):
+    rules = []
+    if hasattr(clf, 'rules'):
+        for col, b, cls, cf in clf.rules:
+            e = clf.bins.get(col, [])
+            if len(e) == 0: rng = f'Bin {b}'
+            elif b == 0: rng = f'≤ {e[0]:.4f}'
+            elif b >= len(e): rng = f'> {e[-1]:.4f}'
+            else: rng = f'({e[b-1]:.4f}, {e[b]:.4f}]'
+            rules.append({'Feature': col, 'Range': rng,
+                          'Class': 'Attack' if cls == 1 else 'Benign',
+                          'Confidence': cf})
+    df = pd.DataFrame(rules)
+    if not df.empty: df = df.sort_values('Confidence', ascending=False)
+    return df
+
+def mcnemar(y, p1, p2):
+    if not HAS_SM:
+        return None
+    bc = bw = a = b = 0
+    for t, x, z in zip(y, p1, p2):
+        if x == t and z == t: bc += 1
+        elif x != t and z != t: bw += 1
+        elif x == t: a += 1
+        else: b += 1
+    if a + b == 0:
+        return 1.0
+    try:
+        return _sm_mcnemar([[bc, a], [b, bw]], exact=True, correction=True).pvalue
+    except Exception:
+        return None
+
+# =============================================================================
+# 12. CLASSIFIER DICTIONARY  (with fixes 2 and 3 applied)
+# =============================================================================
+def build_all(avail_kac, avail_outgoing, avail_ssd):
+    clfs = {}
+    clfs['SSD Only'] = SSDOnly()
+    clfs['SSD (all features)'] = SSDAllClassifier(feature_subset=avail_ssd)
+    clfs['SSD-GR (all features)'] = GranularRoughSetLayer(
+        k=4, feature_subset=avail_ssd)
+
+    clfs['KAC (flat)'] = KhalidAlminshidClassifier(feature_subset=avail_kac)
+    clfs['KAC (all outgoing)'] = KhalidAlminshidClassifier(
+        feature_subset=avail_outgoing)
+
+    clfs['KAC-GR (coarse k=2)'] = KACGranularClassifier(
+        k_values=[2], k_weights=[1.0], feature_subset=avail_kac)
+    clfs['KAC-GR (medium k=4)'] = KACGranularClassifier(
+        k_values=[4], k_weights=[1.0], feature_subset=avail_kac)
+    clfs['KAC-GR (fine k=8)'] = KACGranularClassifier(
+        k_values=[8], k_weights=[1.0], feature_subset=avail_kac)
+    clfs['KAC-GR (multi-level)'] = KACGranularClassifier(
+        k_values=[2, 4, 8], k_weights=[0.2, 0.5, 0.3], feature_subset=avail_kac)
+
+    # ---- FIX 2: single-granularity k=4 over the full outgoing set ----
+    clfs['KAC-GR (all outgoing)'] = KACGranularClassifier(
+        k_values=[4], k_weights=[1.0], feature_subset=avail_outgoing)
+
+    # ---- FIX 3: lower min sizes for standalone rough-set baselines ----
+    clfs['Granular Rough'] = GranularRoughSetLayer(
+        k=4, min_granule_size=2, min_confidence=0.4)
+    clfs['Rough Set (ALONE)'] = RoughSetClassifier(
+        n_bins=6, min_class_size=2, min_samples_per_bin=3,
+        min_confidence=0.4)
+
+    clfs['Random Forest'] = RandomForestClassifier(
+        n_estimators=100, random_state=42, n_jobs=-1)
+    if HAS_XGB:
+        clfs['XGBoost'] = XGBClassifier(
+            n_estimators=100, learning_rate=0.1, random_state=42,
+            use_label_encoder=False, eval_metric='logloss')
+    clfs['Logistic Regression'] = LogisticRegression(max_iter=1000, random_state=42)
+    clfs['Decision Tree'] = DecisionTreeClassifier(random_state=42)
+    clfs['KNN'] = KNeighborsClassifier(n_neighbors=5)
+    clfs['Linear SVM'] = LinearSVC(max_iter=10000, random_state=42, dual='auto')
+    clfs['Gaussian NB'] = GaussianNB()
+    clfs['LDA'] = LinearDiscriminantAnalysis()
+    clfs['Gradient Boosting'] = GradientBoostingClassifier(n_estimators=100, random_state=42)
+    clfs['AdaBoost'] = AdaBoostClassifier(random_state=42)
+    clfs['Extra Trees'] = ExtraTreesClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    clfs['Deep MLP'] = MLPClassifier(hidden_layer_sizes=(64, 32),
+                                      max_iter=200, random_state=42)
+    return clfs
+
+# =============================================================================
+# 13. MAIN
+# =============================================================================
+def main():
+    print("=" * 70)
+    print("📄 PAPER 2 — Khalid Alminshid + Granular Rough Set (all features)")
+    print("=" * 70)
+    print("\n[1] Synthetic (very_hard, 10k)")
+    print("[2] Synthetic (hard)")
+    print("[3] Synthetic (extreme)")
+    print("[4] Real CSV folder")
+    c = input("Enter 1–4: ").strip()
+    if c == '4':
+        folder = input("Folder: ").strip()
+        df = load_folder(folder)
+        if len(df) > 10000:
+            df, _ = train_test_split(df, train_size=10000, stratify=df['label'],
+                                     random_state=42)
+            df = df.reset_index(drop=True)
+    else:
+        diff = {'1': 'very_hard', '2': 'hard', '3': 'extreme'}.get(c, 'very_hard')
+        df = generate_dataset(difficulty=diff)
+
+    print("\n🔧 Deriving KAC + outgoing features...")
+    df = derive_kac_features(df)
+    print("🔧 Deriving stepping-stone features...")
+    df = derive_stepping_stone_features(df)
+
+    X = prep(df.drop('label', axis=1)); y = df['label']
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y,
+                                          random_state=42)
+    Xtr.columns = [re.sub(r'[^a-zA-Z0-9_]', '_', c) for c in Xtr.columns]
+    Xte.columns = [re.sub(r'[^a-zA-Z0-9_]', '_', c) for c in Xte.columns]
+
+    avail_kac = [c for c in KAC_FEATURES if c in Xtr.columns]
+    avail_outgoing = [c for c in ALL_OUTGOING_FEATURES if c in Xtr.columns]
+    avail_ssd = [c for c in STEPPING_STONE_FEATURES if c in Xtr.columns]
+
+    print(f"\n🔍 KAC features: {len(avail_kac)}")
+    print(f"🔍 All outgoing features: {len(avail_outgoing)}")
+    print(f"🔍 All stepping-stone features: {len(avail_ssd)}")
+
+    clfs = build_all(avail_kac, avail_outgoing, avail_ssd)
+
+    print("\n📊 Test evaluation...")
+    results, preds, probas = {}, {}, {}
+    for n, c in clfs.items():
+        t0 = time.time(); c.fit(Xtr, ytr); ft = time.time() - t0
+        t0 = time.time(); p = c.predict(Xte); pt = time.time() - t0
+        results[n] = {'Acc': accuracy_score(yte, p),
+                      'F1': f1_score(yte, p, zero_division=0),
+                      'Prec': precision_score(yte, p, zero_division=0),
+                      'Rec': recall_score(yte, p, zero_division=0),
+                      'Train': ft, 'Infer': pt / len(yte) * 1000}
+        preds[n] = p
+        probas[n] = c.predict_proba(Xte) if hasattr(c, 'predict_proba') else None
+
+    dfres = pd.DataFrame(results).T.round(4)
+    print("\n" + dfres.to_string())
+
+    for name, fname in [
+        ('KAC (flat)', 'paper2_kac_flat_rules.csv'),
+        ('KAC-GR (medium k=4)', 'paper2_kac_gr_medium_rules.csv'),
+        ('KAC-GR (all outgoing)', 'paper2_kac_gr_all_outgoing_rules.csv'),
+        ('SSD-GR (all features)', 'paper2_ssd_gr_rules.csv'),
+    ]:
+        if name in clfs:
+            r = extract_rules(clfs[name])
+            if not r.empty:
+                r.to_csv(fname, index=False)
+                print(f"📋 {fname}")
+
+    plot_roc(yte, {k: v for k, v in probas.items() if v is not None}, 'paper2_roc.png')
+    plot_pr(yte, {k: v for k, v in probas.items() if v is not None}, 'paper2_pr.png')
+    top = sorted(results.items(), key=lambda x: x[1]['F1'], reverse=True)[:6]
+    plot_cm(yte, {n: preds[n] for n, _ in top}, [n for n, _ in top], 'paper2_cm.png')
+
+    for name, fname, title in [
+        ('KAC-GR (medium k=4)', 'paper2_importance_kacgr.png',
+         'Feature Importance — KAC-GR medium'),
+        ('KAC-GR (all outgoing)', 'paper2_importance_kacgr_all.png',
+         'Feature Importance — KAC-GR all outgoing'),
+        ('SSD-GR (all features)', 'paper2_importance_ssd_all.png',
+         'Feature Importance — SSD-GR all features'),
+        ('SSD (all features)', 'paper2_importance_ssd_all_score.png',
+         'Feature Importance — SSD (all features) score'),
+        ('Rough Set (ALONE)', 'paper2_importance_rst.png',
+         'Feature Importance — Rough Set (ALONE)'),
+    ]:
+        if name in clfs:
+            plot_imp(clfs[name], title, fname)
+
+    if 'KAC-GR (multi-level)' in clfs:
+        _, tiers = clfs['KAC-GR (multi-level)'].predict_with_tier(Xte)
+        cnt = Counter(tiers); rows = []
+        for t in ['definite_backdoor', 'possible_backdoor', 'definitely_benign']:
+            c = cnt.get(t, 0)
+            if c > 0:
+                m = np.array([x == t for x in tiers])
+                acc = accuracy_score(yte[m], preds['KAC-GR (multi-level)'][m])
+                rows.append({'Tier': t, 'Count': c, 'Accuracy': acc})
+        pd.DataFrame(rows).to_csv('paper2_tiers.csv', index=False)
+        print("📋 paper2_tiers.csv")
+
+    if HAS_SM:
+        refs = ['KAC-GR (multi-level)', 'KAC-GR (all outgoing)',
+                'SSD (all features)', 'KAC (flat)']
+        for ref in refs:
+            if ref not in preds: continue
+            print(f"\n📊 McNemar vs '{ref}':")
+            for n in preds:
+                if n == ref: continue
+                p = mcnemar(yte, preds[ref], preds[n])
+                if p is not None:
+                    print(f"   vs {n:40s}: p={p:.4f} "
+                          f"{'(sig)' if p < 0.05 else '(ns)'}")
+    print("\n✅ Paper 2 complete.")
+
+if __name__ == "__main__":
+    main()
